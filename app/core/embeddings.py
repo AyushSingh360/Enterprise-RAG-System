@@ -1,98 +1,216 @@
 """
-Embedding service for generating deterministic document and query embeddings.
-Uses OpenAI's text-embedding models for high-quality vector representations.
+Embedding service for generating and caching document/query embeddings.
+
+Features:
+- Deterministic embeddings with SHA-256 hash-based caching
+- Batch processing for efficiency
+- Rebuild-safe indexing (same text = same embedding)
+- OpenAI text-embedding-3-small model
 """
 
 import hashlib
+import json
+from pathlib import Path
 from typing import Optional
 import structlog
 
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.core.embeddings import BaseEmbedding
+from openai import AsyncOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from openai import RateLimitError, APIError
 
 from app.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
 
 
+class EmbeddingCache:
+    """
+    Persistent disk-based cache for embeddings.
+    Uses SHA-256 hash of text as key for deterministic lookups.
+    """
+    
+    def __init__(self, cache_dir: Path):
+        """Initialize the embedding cache."""
+        self.cache_dir = cache_dir / "embedding_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_cache: dict[str, list[float]] = {}
+        self._load_cache_index()
+    
+    def _get_hash(self, text: str) -> str:
+        """Generate SHA-256 hash for text."""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    
+    def _get_cache_path(self, text_hash: str) -> Path:
+        """Get file path for cached embedding."""
+        # Use first 2 chars as subdirectory for better filesystem performance
+        subdir = self.cache_dir / text_hash[:2]
+        subdir.mkdir(exist_ok=True)
+        return subdir / f"{text_hash}.json"
+    
+    def _load_cache_index(self) -> None:
+        """Load cache index into memory for fast lookups."""
+        index_file = self.cache_dir / "index.json"
+        if index_file.exists():
+            try:
+                with open(index_file, "r") as f:
+                    self._index = set(json.load(f))
+            except Exception:
+                self._index = set()
+        else:
+            self._index = set()
+    
+    def _save_cache_index(self) -> None:
+        """Persist cache index to disk."""
+        index_file = self.cache_dir / "index.json"
+        with open(index_file, "w") as f:
+            json.dump(list(self._index), f)
+    
+    def get(self, text: str) -> Optional[list[float]]:
+        """Get cached embedding for text."""
+        text_hash = self._get_hash(text)
+        
+        # Check memory cache first
+        if text_hash in self._memory_cache:
+            return self._memory_cache[text_hash]
+        
+        # Check disk cache
+        if text_hash in self._index:
+            cache_path = self._get_cache_path(text_hash)
+            if cache_path.exists():
+                try:
+                    with open(cache_path, "r") as f:
+                        embedding = json.load(f)
+                    self._memory_cache[text_hash] = embedding
+                    return embedding
+                except Exception as e:
+                    logger.warning("Cache read failed", hash=text_hash[:16], error=str(e))
+        
+        return None
+    
+    def set(self, text: str, embedding: list[float]) -> None:
+        """Cache embedding for text."""
+        text_hash = self._get_hash(text)
+        
+        # Store in memory
+        self._memory_cache[text_hash] = embedding
+        
+        # Store to disk
+        cache_path = self._get_cache_path(text_hash)
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(embedding, f)
+            self._index.add(text_hash)
+            self._save_cache_index()
+        except Exception as e:
+            logger.warning("Cache write failed", hash=text_hash[:16], error=str(e))
+    
+    def clear(self) -> int:
+        """Clear all cached embeddings."""
+        count = len(self._index)
+        self._memory_cache.clear()
+        self._index.clear()
+        self._save_cache_index()
+        
+        # Remove cache files
+        for subdir in self.cache_dir.iterdir():
+            if subdir.is_dir():
+                for file in subdir.glob("*.json"):
+                    file.unlink()
+        
+        return count
+
+
 class EmbeddingService:
     """
     Service for generating embeddings using OpenAI models.
-    Ensures deterministic embeddings for rebuild-safe indexing.
+    
+    Features:
+    - Persistent caching for rebuild-safe indexing
+    - Batch processing for efficiency
+    - Automatic retry with exponential backoff
     """
     
     def __init__(self, settings: Optional[Settings] = None):
-        """
-        Initialize the embedding service.
-        
-        Args:
-            settings: Application settings. If None, loads from environment.
-        """
+        """Initialize the embedding service."""
         self._settings = settings or get_settings()
-        self._embedding_model: Optional[BaseEmbedding] = None
-        self._embedding_cache: dict[str, list[float]] = {}
+        self._client: Optional[AsyncOpenAI] = None
+        self._cache = EmbeddingCache(self._settings.document_store_path)
         
-    @property
-    def embedding_model(self) -> BaseEmbedding:
-        """
-        Get or create the embedding model instance.
-        Uses lazy initialization for efficiency.
-        """
-        if self._embedding_model is None:
-            self._embedding_model = OpenAIEmbedding(
-                model=self._settings.embedding_model,
-                api_key=self._settings.openai_api_key,
-                dimensions=self._settings.embedding_dimension,
-            )
-            logger.info(
-                "Initialized embedding model",
-                model=self._settings.embedding_model,
-                dimensions=self._settings.embedding_dimension
-            )
-        return self._embedding_model
+        logger.info(
+            "Initialized EmbeddingService",
+            model=self._settings.embedding_model,
+            dimension=self._settings.embedding_dimension,
+        )
     
-    def _compute_text_hash(self, text: str) -> str:
-        """
-        Compute a deterministic hash for text.
-        Used for caching and rebuild-safe indexing.
-        
-        Args:
-            text: The text to hash.
-            
-        Returns:
-            SHA-256 hash of the text.
-        """
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Get or create AsyncOpenAI client."""
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                api_key=self._settings.openai_api_key_value,
+                organization=self._settings.openai_org_id,
+            )
+        return self._client
+    
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        retry=retry_if_exception_type((RateLimitError, APIError)),
+    )
+    async def _generate_embedding(self, text: str) -> list[float]:
+        """Generate embedding for a single text using OpenAI API."""
+        response = await self.client.embeddings.create(
+            model=self._settings.embedding_model,
+            input=text,
+            dimensions=self._settings.embedding_dimension,
+        )
+        return response.data[0].embedding
+    
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        retry=retry_if_exception_type((RateLimitError, APIError)),
+    )
+    async def _generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts in a single API call."""
+        response = await self.client.embeddings.create(
+            model=self._settings.embedding_model,
+            input=texts,
+            dimensions=self._settings.embedding_dimension,
+        )
+        # Sort by index to maintain order
+        sorted_data = sorted(response.data, key=lambda x: x.index)
+        return [item.embedding for item in sorted_data]
     
     async def get_embedding(self, text: str, use_cache: bool = True) -> list[float]:
         """
-        Generate embedding for a single text.
+        Get embedding for text, using cache if available.
         
         Args:
-            text: The text to embed.
-            use_cache: Whether to use cached embeddings if available.
+            text: Text to embed.
+            use_cache: Whether to use cached embedding if available.
             
         Returns:
-            Embedding vector as a list of floats.
+            Embedding vector as list of floats.
         """
-        text_hash = self._compute_text_hash(text)
-        
-        # Check cache first
-        if use_cache and text_hash in self._embedding_cache:
-            logger.debug("Cache hit for embedding", hash=text_hash[:16])
-            return self._embedding_cache[text_hash]
+        # Check cache
+        if use_cache:
+            cached = self._cache.get(text)
+            if cached is not None:
+                logger.debug("Cache hit for embedding", text_length=len(text))
+                return cached
         
         # Generate new embedding
-        embedding = await self.embedding_model.aget_text_embedding(text)
+        embedding = await self._generate_embedding(text)
         
-        # Cache the result
+        # Cache result
         if use_cache:
-            self._embedding_cache[text_hash] = embedding
-            
+            self._cache.set(text, embedding)
+        
         logger.debug(
             "Generated embedding",
             text_length=len(text),
-            embedding_dim=len(embedding)
+            dimension=len(embedding),
         )
         
         return embedding
@@ -100,10 +218,10 @@ class EmbeddingService:
     async def get_embeddings_batch(
         self,
         texts: list[str],
-        use_cache: bool = True
+        use_cache: bool = True,
     ) -> list[list[float]]:
         """
-        Generate embeddings for multiple texts in batch.
+        Get embeddings for multiple texts with caching.
         
         Args:
             texts: List of texts to embed.
@@ -112,81 +230,74 @@ class EmbeddingService:
         Returns:
             List of embedding vectors.
         """
-        embeddings: list[list[float]] = []
+        results: list[Optional[list[float]]] = [None] * len(texts)
         texts_to_embed: list[tuple[int, str]] = []
         
         # Check cache for each text
         for i, text in enumerate(texts):
-            text_hash = self._compute_text_hash(text)
-            if use_cache and text_hash in self._embedding_cache:
-                embeddings.append(self._embedding_cache[text_hash])
-            else:
-                texts_to_embed.append((i, text))
-                embeddings.append([])  # Placeholder
+            if use_cache:
+                cached = self._cache.get(text)
+                if cached is not None:
+                    results[i] = cached
+                    continue
+            texts_to_embed.append((i, text))
         
-        # Batch embed uncached texts
+        cache_hits = len(texts) - len(texts_to_embed)
+        
+        # Generate embeddings for uncached texts in batches
         if texts_to_embed:
-            uncached_texts = [t[1] for t in texts_to_embed]
-            new_embeddings = await self.embedding_model.aget_text_embedding_batch(
-                uncached_texts
-            )
+            batch_size = self._settings.embedding_batch_size
             
-            # Fill in the results and cache
-            for (idx, text), embedding in zip(texts_to_embed, new_embeddings):
-                embeddings[idx] = embedding
-                if use_cache:
-                    text_hash = self._compute_text_hash(text)
-                    self._embedding_cache[text_hash] = embedding
+            for batch_start in range(0, len(texts_to_embed), batch_size):
+                batch = texts_to_embed[batch_start:batch_start + batch_size]
+                batch_texts = [t[1] for t in batch]
+                
+                embeddings = await self._generate_embeddings_batch(batch_texts)
+                
+                for (idx, text), embedding in zip(batch, embeddings):
+                    results[idx] = embedding
+                    if use_cache:
+                        self._cache.set(text, embedding)
         
         logger.info(
-            "Generated batch embeddings",
+            "Batch embeddings complete",
             total=len(texts),
-            cache_hits=len(texts) - len(texts_to_embed),
-            new_embeddings=len(texts_to_embed)
+            cache_hits=cache_hits,
+            generated=len(texts_to_embed),
         )
         
-        return embeddings
+        return results  # type: ignore
     
     async def get_query_embedding(self, query: str) -> list[float]:
         """
-        Generate embedding for a query.
-        Query embeddings are not cached as queries are typically unique.
+        Get embedding for a query (not cached by default).
         
         Args:
-            query: The query text to embed.
+            query: Query text to embed.
             
         Returns:
             Query embedding vector.
         """
-        embedding = await self.embedding_model.aget_query_embedding(query)
-        logger.debug("Generated query embedding", query_length=len(query))
-        return embedding
+        # Queries are typically unique, so don't cache by default
+        return await self.get_embedding(query, use_cache=False)
     
     def clear_cache(self) -> int:
-        """
-        Clear the embedding cache.
-        
-        Returns:
-            Number of cached embeddings cleared.
-        """
-        count = len(self._embedding_cache)
-        self._embedding_cache.clear()
+        """Clear the embedding cache."""
+        count = self._cache.clear()
         logger.info("Cleared embedding cache", count=count)
         return count
     
     async def health_check(self) -> dict[str, str]:
-        """
-        Check if the embedding service is healthy.
-        
-        Returns:
-            Health status dictionary.
-        """
+        """Check if the embedding service is healthy."""
         try:
-            # Try to generate a test embedding
-            test_embedding = await self.get_embedding("health check", use_cache=False)
+            test_embedding = await self.get_embedding("health check test", use_cache=False)
             if len(test_embedding) == self._settings.embedding_dimension:
-                return {"status": "healthy", "model": self._settings.embedding_model}
-            return {"status": "unhealthy", "error": "Unexpected embedding dimension"}
+                return {
+                    "status": "healthy",
+                    "model": self._settings.embedding_model,
+                    "dimension": str(self._settings.embedding_dimension),
+                }
+            return {"status": "unhealthy", "error": "Unexpected dimension"}
         except Exception as e:
             logger.error("Embedding health check failed", error=str(e))
             return {"status": "unhealthy", "error": str(e)}

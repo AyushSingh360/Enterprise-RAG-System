@@ -3,7 +3,7 @@ Pydantic schemas for API request/response validation.
 """
 
 from app.schemas.documents import (
-    DocumentMetadata,
+    DocumentType,
     IngestRequest,
     IngestResponse,
     DocumentInfo,
@@ -17,10 +17,11 @@ from app.schemas.query import (
 from app.schemas.common import (
     HealthResponse,
     ErrorResponse,
+    ErrorDetail,
 )
 
 __all__ = [
-    "DocumentMetadata",
+    "DocumentType",
     "IngestRequest",
     "IngestResponse",
     "DocumentInfo",
@@ -30,4 +31,5 @@ __all__ = [
     "RetrievedContext",
     "HealthResponse",
     "ErrorResponse",
+    "ErrorDetail",
 ]

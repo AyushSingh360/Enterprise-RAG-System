@@ -1,8 +1,7 @@
 """
-Query-related schemas for retrieval and generation operations.
+Query and response schemas with mandatory citations.
 """
 
-from datetime import datetime
 from typing import Optional, Any
 
 from pydantic import BaseModel, Field
@@ -14,50 +13,54 @@ class QueryRequest(BaseModel):
     question: str = Field(
         min_length=1,
         max_length=2000,
-        description="The question to answer from the document corpus"
+        description="Question to answer from documents"
     )
     top_k: Optional[int] = Field(
         default=None,
         ge=1,
         le=10,
-        description="Number of documents to retrieve (overrides default)"
+        description="Max documents to retrieve (default: 5)"
     )
     similarity_threshold: Optional[float] = Field(
         default=None,
         ge=0.0,
         le=1.0,
-        description="Minimum similarity score threshold (overrides default)"
+        description="Min similarity score (default: 0.7)"
     )
     include_context: bool = Field(
         default=False,
-        description="Whether to include retrieved context in response"
+        description="Include retrieved context in response"
     )
     metadata_filter: Optional[dict[str, Any]] = Field(
         default=None,
-        description="Filter documents by metadata fields"
+        description="Filter by metadata fields"
     )
     
     model_config = {
         "json_schema_extra": {
             "example": {
-                "question": "What is the company's policy on remote work?",
+                "question": "What is the company's vacation policy?",
                 "top_k": 5,
                 "similarity_threshold": 0.7,
-                "include_context": True,
-                "metadata_filter": {"department": "HR"}
+                "include_context": False,
+                "metadata_filter": None
             }
         }
     }
 
 
 class SourceCitation(BaseModel):
-    """Citation information for a source document."""
+    """
+    Citation for a source document.
+    
+    MANDATORY in every response with an answer.
+    """
     
     document_id: str = Field(
-        description="Unique identifier of the source document"
+        description="Document identifier"
     )
     source: str = Field(
-        description="Original source name/path"
+        description="Source name (filename)"
     )
     page_number: Optional[int] = Field(
         default=None,
@@ -70,30 +73,44 @@ class SourceCitation(BaseModel):
     relevance_score: float = Field(
         ge=0.0,
         le=1.0,
-        description="Similarity/relevance score"
+        description="Relevance/similarity score"
     )
     chunk_text: Optional[str] = Field(
         default=None,
-        description="Relevant text excerpt from the source"
+        max_length=500,
+        description="Excerpt from source (max 500 chars)"
     )
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "document_id": "doc_abc123",
+                "source": "hr_policies.pdf",
+                "page_number": 15,
+                "section": "Vacation Policy",
+                "relevance_score": 0.92,
+                "chunk_text": "Employees are entitled to 20 days..."
+            }
+        }
+    }
 
 
 class RetrievedContext(BaseModel):
-    """Context retrieved from the vector store."""
+    """Retrieved context chunk (optional in response)."""
     
     chunk_id: str = Field(
-        description="Unique identifier of the chunk"
+        description="Chunk identifier"
     )
     document_id: str = Field(
         description="Parent document identifier"
     )
     text: str = Field(
-        description="The retrieved text content"
+        description="Full chunk text"
     )
     similarity_score: float = Field(
         ge=0.0,
         le=1.0,
-        description="Similarity score to the query"
+        description="Similarity score"
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
@@ -102,77 +119,77 @@ class RetrievedContext(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """Response schema for query operations."""
+    """
+    Response schema for queries.
+    
+    IMPORTANT: sources array is MANDATORY and contains citations.
+    If no answer found, sources will be empty and answer will be
+    "Answer not found in documents."
+    """
     
     success: bool = Field(
-        description="Whether the query was processed successfully"
+        description="Whether query was processed successfully"
     )
     answer: str = Field(
-        description="The generated answer or 'Answer not found in documents'"
+        description="Generated answer or 'Answer not found in documents.'"
     )
     sources: list[SourceCitation] = Field(
-        default_factory=list,
-        description="List of source citations for the answer"
+        description="MANDATORY: Source citations for the answer (empty if no answer)"
     )
     context: Optional[list[RetrievedContext]] = Field(
         default=None,
-        description="Retrieved context (if include_context=True)"
+        description="Retrieved context (only if include_context=True)"
     )
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Confidence score of the answer"
+        description="Answer confidence (0.0 = no answer)"
     )
     query_time_ms: float = Field(
-        default=0.0,
-        description="Total query processing time in milliseconds"
+        ge=0,
+        description="Total query time in milliseconds"
     )
     retrieval_time_ms: float = Field(
-        default=0.0,
-        description="Time spent on retrieval in milliseconds"
+        ge=0,
+        description="Retrieval phase time in milliseconds"
     )
     generation_time_ms: float = Field(
-        default=0.0,
-        description="Time spent on generation in milliseconds"
+        ge=0,
+        description="Generation phase time in milliseconds"
     )
     
     model_config = {
         "json_schema_extra": {
-            "example": {
-                "success": True,
-                "answer": "According to the company policy, employees can work remotely up to 3 days per week with manager approval.",
-                "sources": [
-                    {
-                        "document_id": "doc_abc123",
-                        "source": "hr_policies.pdf",
-                        "page_number": 15,
-                        "section": "Remote Work Policy",
-                        "relevance_score": 0.92,
-                        "chunk_text": "Employees may request remote work arrangements..."
-                    }
-                ],
-                "context": None,
-                "confidence": 0.89,
-                "query_time_ms": 1245.67,
-                "retrieval_time_ms": 89.23,
-                "generation_time_ms": 1156.44
-            }
+            "examples": [
+                {
+                    "success": True,
+                    "answer": "Employees are entitled to 20 vacation days per year. [Source 1]",
+                    "sources": [
+                        {
+                            "document_id": "doc_abc123",
+                            "source": "hr_policies.pdf",
+                            "page_number": 15,
+                            "section": "Vacation Policy",
+                            "relevance_score": 0.92,
+                            "chunk_text": "Employees are entitled to 20 days..."
+                        }
+                    ],
+                    "context": None,
+                    "confidence": 0.89,
+                    "query_time_ms": 1245.67,
+                    "retrieval_time_ms": 89.23,
+                    "generation_time_ms": 1156.44
+                },
+                {
+                    "success": True,
+                    "answer": "Answer not found in documents.",
+                    "sources": [],
+                    "context": None,
+                    "confidence": 0.0,
+                    "query_time_ms": 234.56,
+                    "retrieval_time_ms": 234.56,
+                    "generation_time_ms": 0.0
+                }
+            ]
         }
     }
-
-
-class NoAnswerResponse(QueryResponse):
-    """Special response when no relevant context is found."""
-    
-    answer: str = Field(
-        default="Answer not found in documents",
-        description="Fixed response for no context scenarios"
-    )
-    confidence: float = Field(
-        default=0.0,
-        description="Zero confidence when no answer found"
-    )
-    sources: list[SourceCitation] = Field(
-        default_factory=list,
-        description="Empty sources list"
-    )

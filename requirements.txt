@@ -5,12 +5,12 @@ pydantic==2.5.3
 pydantic-settings==2.1.0
 python-multipart==0.0.6
 
-# LlamaIndex Core
-llama-index==0.10.12
-llama-index-core==0.10.12
-llama-index-embeddings-openai==0.1.6
-llama-index-llms-openai==0.1.6
-llama-index-vector-stores-faiss==0.1.1
+# OpenAI SDK
+openai==1.12.0
+
+# Vector Store
+faiss-cpu==1.7.4
+numpy>=1.24.0,<2.0.0
 
 # Document Processing
 pypdf==4.0.1
@@ -18,18 +18,14 @@ python-docx==1.1.0
 markdown==3.5.2
 beautifulsoup4==4.12.3
 
-# Database
-sqlalchemy==2.0.25
-aiosqlite==0.19.0
-
-# Vector Store
-faiss-cpu==1.7.4
-
 # Utilities
 python-dotenv==1.0.0
-tiktoken==0.5.2
 tenacity==8.2.3
 httpx==0.26.0
 
 # Logging
 structlog==24.1.0
+
+# Type checking (dev)
+# mypy==1.8.0
+# types-Markdown==3.5.0

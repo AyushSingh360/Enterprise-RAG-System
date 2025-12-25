@@ -1,226 +1,266 @@
 """
-LLM service for context-based answer generation.
-Implements strict no-hallucination policies through system prompts.
+LLM service for context-constrained answer generation.
+
+CRITICAL: The LLM is constrained to ONLY use provided context.
+It must NEVER use prior knowledge or hallucinate answers.
 """
 
 from typing import Optional
 import structlog
 
-from llama_index.llms.openai import OpenAI
-from llama_index.core.llms import ChatMessage, MessageRole
+from openai import AsyncOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
 
 
-# System prompt that enforces no hallucination
-NO_HALLUCINATION_SYSTEM_PROMPT = """You are a precise and accurate AI assistant for an Enterprise RAG system.
+# =============================================================================
+# SYSTEM PROMPT: NO HALLUCINATION - CONTEXT ONLY
+# =============================================================================
 
-CRITICAL RULES - YOU MUST FOLLOW THESE EXACTLY:
+SYSTEM_PROMPT = """You are a precise document-based question answering assistant.
 
-1. ONLY use information from the provided context to answer questions.
-2. NEVER use your prior knowledge or training data to answer.
-3. NEVER make assumptions or inferences beyond what is explicitly stated in the context.
-4. If the context does not contain sufficient information to answer the question, you MUST respond with exactly: "I don't know based on the provided documents."
-5. If the context is empty or not relevant to the question, respond with: "Answer not found in documents."
-6. Always cite which document(s) you used to formulate your answer.
-7. Be concise and direct in your responses.
-8. Do not add any information that is not present in the context.
-9. If you are uncertain about any part of your answer, acknowledge the uncertainty.
-10. Never fabricate facts, statistics, dates, names, or any other information.
+ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
 
-Remember: Your primary purpose is to provide accurate information FROM THE DOCUMENTS ONLY.
-Accuracy and honesty are more important than providing an answer."""
+1. You may ONLY use information explicitly stated in the provided CONTEXT.
+2. You must NEVER use your training data, prior knowledge, or make assumptions.
+3. You must NEVER invent, guess, or infer information not in the CONTEXT.
+4. If the CONTEXT does not contain enough information to answer, you MUST respond:
+   "I don't know based on the provided documents."
+5. If the CONTEXT is empty or completely irrelevant, you MUST respond:
+   "Answer not found in documents."
+6. Always cite which source(s) you used with [Source N] notation.
+7. Be concise, accurate, and direct.
+8. Never apologize or explain that you're an AI.
+
+CORRECT BEHAVIOR:
+- Context says "The policy allows 3 remote days" → Answer: "The policy allows 3 remote work days per week. [Source 1]"
+- Context doesn't mention the topic → Answer: "I don't know based on the provided documents."
+- Empty context → Answer: "Answer not found in documents."
+
+INCORRECT BEHAVIOR (NEVER DO THIS):
+- Making up statistics or dates not in context
+- Providing general knowledge answers
+- Saying "typically" or "usually" without context support
+- Adding information "for completeness"
+
+You exist ONLY to relay information FROM the documents. Nothing else."""
 
 
-ANSWER_GENERATION_PROMPT = """Based ONLY on the following context, answer the user's question.
-
-CONTEXT:
+USER_PROMPT_TEMPLATE = """CONTEXT (Use ONLY this information):
 {context}
 
-SOURCES PROVIDED:
+SOURCES:
 {sources}
 
-USER QUESTION: {question}
+QUESTION: {question}
 
-INSTRUCTIONS:
-- Use ONLY the information from the context above
-- If the context doesn't contain the answer, say "I don't know based on the provided documents."
-- Cite the relevant source(s) in your answer
-- Be concise and accurate
+Provide a precise answer using ONLY the context above. Cite sources with [Source N]."""
 
-YOUR ANSWER:"""
 
+# =============================================================================
+# LLM Service
+# =============================================================================
 
 class LLMService:
     """
-    Service for LLM-based answer generation with strict context adherence.
+    LLM service for generating answers constrained to provided context.
+    
+    Features:
+    - Strict system prompt enforcing no hallucination
+    - Context-only answer generation
+    - Confidence scoring
+    - Automatic retry with exponential backoff
     """
     
+    # Phrases indicating LLM couldn't find answer
+    NO_ANSWER_PHRASES = [
+        "answer not found in documents",
+        "i don't know",
+        "not mentioned in",
+        "no information",
+        "cannot find",
+        "cannot determine",
+        "not specified in",
+        "not stated in",
+        "no relevant information",
+        "insufficient information",
+    ]
+    
     def __init__(self, settings: Optional[Settings] = None):
-        """
-        Initialize the LLM service.
-        
-        Args:
-            settings: Application settings.
-        """
+        """Initialize the LLM service."""
         self._settings = settings or get_settings()
-        self._llm: Optional[OpenAI] = None
+        self._client: Optional[AsyncOpenAI] = None
+        
+        logger.info(
+            "Initialized LLMService",
+            model=self._settings.llm_model,
+            temperature=self._settings.llm_temperature,
+        )
     
     @property
-    def llm(self) -> OpenAI:
-        """Get or create the LLM instance."""
-        if self._llm is None:
-            self._llm = OpenAI(
-                model=self._settings.llm_model,
-                api_key=self._settings.openai_api_key,
-                temperature=self._settings.llm_temperature,
-                max_tokens=self._settings.llm_max_tokens,
-                system_prompt=NO_HALLUCINATION_SYSTEM_PROMPT,
+    def client(self) -> AsyncOpenAI:
+        """Get or create AsyncOpenAI client."""
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                api_key=self._settings.openai_api_key_value,
+                organization=self._settings.openai_org_id,
+                timeout=self._settings.llm_timeout,
             )
-            logger.info(
-                "Initialized LLM",
-                model=self._settings.llm_model,
-                temperature=self._settings.llm_temperature
-            )
-        return self._llm
+        return self._client
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+    )
+    async def _call_llm(self, system: str, user: str) -> str:
+        """Make LLM API call with retry logic."""
+        response = await self.client.chat.completions.create(
+            model=self._settings.llm_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=self._settings.llm_temperature,
+            max_tokens=self._settings.llm_max_tokens,
+        )
+        return response.choices[0].message.content or ""
+    
+    def _format_context(
+        self,
+        context_texts: list[str],
+        source_labels: list[str],
+    ) -> tuple[str, str]:
+        """Format context and sources for the prompt."""
+        if not context_texts:
+            return "", ""
+        
+        # Format context with source labels
+        context_parts = []
+        for i, (text, label) in enumerate(zip(context_texts, source_labels), 1):
+            context_parts.append(f"[Source {i}] ({label}):\n{text}")
+        
+        formatted_context = "\n\n---\n\n".join(context_parts)
+        
+        # Format source list
+        sources = ", ".join([
+            f"[Source {i}]: {label}"
+            for i, label in enumerate(source_labels, 1)
+        ])
+        
+        return formatted_context, sources
+    
+    def _is_no_answer(self, response: str) -> bool:
+        """Check if response indicates no answer was found."""
+        response_lower = response.lower()
+        return any(phrase in response_lower for phrase in self.NO_ANSWER_PHRASES)
+    
+    def _calculate_confidence(
+        self,
+        answer: str,
+        context_count: int,
+    ) -> float:
+        """
+        Calculate confidence score for the answer.
+        
+        Scoring:
+        - 0.0: No answer found
+        - 0.5-0.95: Answer found with varying confidence
+        """
+        if self._is_no_answer(answer):
+            return 0.0
+        
+        confidence = 0.5
+        
+        # More context = higher confidence
+        if context_count >= 2:
+            confidence += 0.15
+        if context_count >= 3:
+            confidence += 0.1
+        
+        # Longer, more detailed answers = higher confidence
+        if len(answer) > 100:
+            confidence += 0.1
+        if len(answer) > 200:
+            confidence += 0.05
+        
+        # Has citations = higher confidence
+        if "[source" in answer.lower():
+            confidence += 0.1
+        
+        return min(confidence, 0.95)
     
     async def generate_answer(
         self,
         question: str,
         context_texts: list[str],
-        source_citations: list[str]
+        source_labels: list[str],
     ) -> tuple[str, float]:
         """
-        Generate an answer based on the provided context.
+        Generate an answer using ONLY the provided context.
         
         Args:
-            question: The user's question.
-            context_texts: List of relevant context passages.
-            source_citations: List of source identifiers.
+            question: User's question.
+            context_texts: Retrieved document chunks.
+            source_labels: Labels for each source (e.g., "doc.pdf, page 5").
             
         Returns:
             Tuple of (answer, confidence_score).
+            
+        IMPORTANT: If context is empty, returns "Answer not found in documents."
         """
-        # Handle empty context
+        # Handle empty context - NO generation attempted
         if not context_texts:
-            logger.info("No context provided, returning no-answer response")
+            logger.info(
+                "No context provided, returning no-answer",
+                question=question[:100],
+            )
             return "Answer not found in documents.", 0.0
         
-        # Format context and sources
-        formatted_context = "\n\n---\n\n".join([
-            f"[Source {i+1}]: {text}"
-            for i, text in enumerate(context_texts)
-        ])
-        
-        formatted_sources = ", ".join([
-            f"[{i+1}] {source}"
-            for i, source in enumerate(source_citations)
-        ])
-        
-        # Create the prompt
-        user_prompt = ANSWER_GENERATION_PROMPT.format(
-            context=formatted_context,
-            sources=formatted_sources,
-            question=question
+        # Format prompt
+        formatted_context, formatted_sources = self._format_context(
+            context_texts, source_labels
         )
         
-        # Generate response
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=NO_HALLUCINATION_SYSTEM_PROMPT),
-            ChatMessage(role=MessageRole.USER, content=user_prompt)
-        ]
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            context=formatted_context,
+            sources=formatted_sources,
+            question=question,
+        )
         
-        response = await self.llm.achat(messages)
-        answer = response.message.content.strip()
+        # Call LLM
+        answer = await self._call_llm(SYSTEM_PROMPT, user_prompt)
+        answer = answer.strip()
         
-        # Calculate confidence based on response characteristics
-        confidence = self._calculate_confidence(answer, context_texts)
+        # Calculate confidence
+        confidence = self._calculate_confidence(answer, len(context_texts))
         
         logger.info(
             "Generated answer",
             question_length=len(question),
             context_count=len(context_texts),
             answer_length=len(answer),
-            confidence=confidence
+            confidence=confidence,
+            is_no_answer=self._is_no_answer(answer),
         )
         
         return answer, confidence
     
-    def _calculate_confidence(
-        self,
-        answer: str,
-        context_texts: list[str]
-    ) -> float:
-        """
-        Calculate a confidence score for the answer.
-        
-        This is a heuristic-based calculation considering:
-        - Whether the answer indicates uncertainty
-        - Length and specificity of the answer
-        - Presence of citations
-        
-        Args:
-            answer: The generated answer.
-            context_texts: The context used for generation.
-            
-        Returns:
-            Confidence score between 0.0 and 1.0.
-        """
-        answer_lower = answer.lower()
-        
-        # Low confidence indicators
-        low_confidence_phrases = [
-            "i don't know",
-            "not found in documents",
-            "answer not found",
-            "no information",
-            "cannot determine",
-            "unclear from the context",
-            "not mentioned",
-            "not specified"
-        ]
-        
-        for phrase in low_confidence_phrases:
-            if phrase in answer_lower:
-                return 0.0
-        
-        # Base confidence starts at 0.5
-        confidence = 0.5
-        
-        # Increase confidence if answer is substantive
-        if len(answer) > 50:
-            confidence += 0.1
-        if len(answer) > 100:
-            confidence += 0.1
-        
-        # Increase confidence if sources are cited
-        if any(f"[{i+1}]" in answer or f"source {i+1}" in answer_lower 
-               for i in range(len(context_texts))):
-            confidence += 0.15
-        
-        # Increase confidence based on context quantity
-        if len(context_texts) >= 2:
-            confidence += 0.1
-        if len(context_texts) >= 3:
-            confidence += 0.05
-        
-        # Cap at 0.95 (never 100% confident)
-        return min(confidence, 0.95)
-    
     async def health_check(self) -> dict[str, str]:
-        """Check if the LLM service is healthy."""
+        """Check if LLM service is healthy."""
         try:
-            # Simple test query
-            messages = [
-                ChatMessage(role=MessageRole.USER, content="Say 'OK' if you are operational.")
-            ]
-            response = await self.llm.achat(messages)
-            
-            if response.message.content:
-                return {"status": "healthy", "model": self._settings.llm_model}
-            return {"status": "unhealthy", "error": "Empty response from LLM"}
+            response = await self._call_llm(
+                system="Respond with exactly: OK",
+                user="Health check",
+            )
+            if response.strip():
+                return {
+                    "status": "healthy",
+                    "model": self._settings.llm_model,
+                }
+            return {"status": "unhealthy", "error": "Empty response"}
         except Exception as e:
             logger.error("LLM health check failed", error=str(e))
             return {"status": "unhealthy", "error": str(e)}

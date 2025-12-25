@@ -1,107 +1,71 @@
 """
-Document-related schemas for ingestion operations.
+Document and ingestion schemas.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, Any
-from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
 
 class DocumentType(str, Enum):
-    """Supported document types for ingestion."""
+    """Supported document types."""
     PDF = "pdf"
     DOCX = "docx"
     MARKDOWN = "markdown"
-    SQL = "sql"
-
-
-class DocumentMetadata(BaseModel):
-    """Metadata associated with a document."""
-    
-    source: str = Field(
-        description="Original source/filename of the document"
-    )
-    document_type: DocumentType = Field(
-        description="Type of the document"
-    )
-    page_number: Optional[int] = Field(
-        default=None,
-        description="Page number if applicable"
-    )
-    section: Optional[str] = Field(
-        default=None,
-        description="Section or chapter name if applicable"
-    )
-    title: Optional[str] = Field(
-        default=None,
-        description="Document title if available"
-    )
-    author: Optional[str] = Field(
-        default=None,
-        description="Document author if available"
-    )
-    created_at: datetime = Field(
-        default_factory=datetime.utcnow,
-        description="Timestamp when document was ingested"
-    )
-    custom_metadata: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Additional custom metadata"
-    )
 
 
 class IngestRequest(BaseModel):
     """Request schema for document ingestion."""
     
     document_type: DocumentType = Field(
-        description="Type of document being ingested"
-    )
-    content: Optional[str] = Field(
-        default=None,
-        description="Raw text content (for markdown/sql)"
+        description="Type of document to ingest"
     )
     file_path: Optional[str] = Field(
         default=None,
-        description="Path to file on server (for PDF/DOCX)"
+        description="Path to file (required for PDF/DOCX)"
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description="Raw content (for Markdown)"
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional metadata to attach"
     )
     
-    # SQL-specific fields
-    sql_query: Optional[str] = Field(
-        default=None,
-        description="SQL query to execute for data extraction"
-    )
-    connection_string: Optional[str] = Field(
-        default=None,
-        description="Database connection string (for SQL type)"
-    )
-    
-    @field_validator("file_path", mode="before")
+    @field_validator("file_path", mode="after")
     @classmethod
-    def validate_file_path(cls, v: Optional[str]) -> Optional[str]:
-        """Validate that file path exists if provided."""
-        if v is not None:
-            path = Path(v)
-            if not path.exists():
-                raise ValueError(f"File not found: {v}")
+    def validate_file_path(cls, v: Optional[str], info) -> Optional[str]:
+        """Validate file path is provided for file-based types."""
         return v
+    
+    def model_post_init(self, __context: Any) -> None:
+        """Validate that required fields are present based on type."""
+        if self.document_type in (DocumentType.PDF, DocumentType.DOCX):
+            if not self.file_path:
+                raise ValueError(
+                    f"{self.document_type.value.upper()} requires file_path"
+                )
+        elif self.document_type == DocumentType.MARKDOWN:
+            if not self.content and not self.file_path:
+                raise ValueError("Markdown requires content or file_path")
     
     model_config = {
         "json_schema_extra": {
-            "example": {
-                "document_type": "pdf",
-                "file_path": "/path/to/document.pdf",
-                "metadata": {
-                    "department": "Engineering",
-                    "project": "RAG System"
+            "examples": [
+                {
+                    "document_type": "pdf",
+                    "file_path": "/path/to/document.pdf",
+                    "metadata": {"department": "Engineering"}
+                },
+                {
+                    "document_type": "markdown",
+                    "content": "# Title\n\nDocument content here.",
+                    "metadata": {"source": "manual_input"}
                 }
-            }
+            ]
         }
     }
 
@@ -110,45 +74,61 @@ class DocumentInfo(BaseModel):
     """Information about an ingested document."""
     
     document_id: str = Field(
-        description="Unique identifier for the document"
+        description="Unique document identifier"
     )
     source: str = Field(
-        description="Original source of the document"
+        description="Document source name"
     )
     document_type: DocumentType = Field(
-        description="Type of the document"
+        description="Type of document"
     )
     chunk_count: int = Field(
-        description="Number of chunks created from this document"
+        ge=0,
+        description="Number of chunks created"
     )
     ingested_at: datetime = Field(
-        description="Timestamp when document was ingested"
+        description="Ingestion timestamp (UTC)"
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Document metadata"
     )
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "document_id": "doc_abc123def456",
+                "source": "policy_manual.pdf",
+                "document_type": "pdf",
+                "chunk_count": 42,
+                "ingested_at": "2024-01-15T10:30:00Z",
+                "metadata": {"department": "HR"}
+            }
+        }
+    }
 
 
 class IngestResponse(BaseModel):
     """Response schema for document ingestion."""
     
     success: bool = Field(
-        description="Whether ingestion was successful"
+        description="Whether ingestion succeeded"
     )
     message: str = Field(
         description="Status message"
     )
     documents: list[DocumentInfo] = Field(
         default_factory=list,
-        description="List of ingested documents with their info"
+        description="Ingested document information"
     )
     total_chunks: int = Field(
         default=0,
-        description="Total number of chunks created"
+        ge=0,
+        description="Total chunks created"
     )
     processing_time_ms: float = Field(
         default=0.0,
+        ge=0,
         description="Processing time in milliseconds"
     )
     
@@ -156,18 +136,18 @@ class IngestResponse(BaseModel):
         "json_schema_extra": {
             "example": {
                 "success": True,
-                "message": "Successfully ingested 1 document",
+                "message": "Successfully ingested with 42 chunks",
                 "documents": [
                     {
-                        "document_id": "doc_abc123",
-                        "source": "technical_manual.pdf",
+                        "document_id": "doc_abc123def456",
+                        "source": "policy_manual.pdf",
                         "document_type": "pdf",
-                        "chunk_count": 45,
+                        "chunk_count": 42,
                         "ingested_at": "2024-01-15T10:30:00Z",
-                        "metadata": {"department": "Engineering"}
+                        "metadata": {}
                     }
                 ],
-                "total_chunks": 45,
+                "total_chunks": 42,
                 "processing_time_ms": 1523.45
             }
         }

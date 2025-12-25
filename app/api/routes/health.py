@@ -2,49 +2,48 @@
 Health check endpoint.
 """
 
-from datetime import datetime
-from fastapi import APIRouter, Depends
+from datetime import datetime, timezone
+
+from fastapi import APIRouter
 
 from app import __version__
 from app.schemas.common import HealthResponse
-from app.api.dependencies import get_retriever_service
-from app.core.retriever import RetrieverService
+from app.config import get_settings
 
-router = APIRouter(tags=["Health"])
+router = APIRouter()
 
 
 @router.get(
     "/health",
     response_model=HealthResponse,
     summary="Health Check",
-    description="Check the health status of the RAG system and its components."
+    description="Check health status of RAG system.",
 )
-async def health_check(
-    retriever: RetrieverService = Depends(get_retriever_service)
-) -> HealthResponse:
+async def health_check() -> HealthResponse:
     """
-    Returns health status of all system components.
+    Check health of system.
+    
+    Returns basic health status without calling external APIs
+    to avoid unnecessary latency and API costs.
     """
-    components = {}
+    settings = get_settings()
     
-    # Check embedding service
-    embedding_health = await retriever.embedding_service.health_check()
-    components["embeddings"] = embedding_health.get("status", "unknown")
+    components = {
+        "api": "healthy",
+        "config": "healthy" if settings.openai_api_key_value else "unhealthy",
+    }
     
-    # Check vector store
-    vector_health = await retriever.vector_store.health_check()
-    components["vector_store"] = vector_health.get("status", "unknown")
+    # Check if FAISS index directory exists
+    if settings.faiss_index_path.exists():
+        components["vector_store"] = "healthy"
+    else:
+        components["vector_store"] = "initializing"
     
-    # Check LLM service
-    llm_health = await retriever.llm_service.health_check()
-    components["llm"] = llm_health.get("status", "unknown")
-    
-    # Overall status
-    all_healthy = all(s == "healthy" for s in components.values())
+    overall = "healthy" if all(v == "healthy" for v in components.values()) else "degraded"
     
     return HealthResponse(
-        status="healthy" if all_healthy else "degraded",
+        status=overall,
         version=__version__,
-        timestamp=datetime.utcnow(),
-        components=components
+        timestamp=datetime.now(timezone.utc),
+        components=components,
     )

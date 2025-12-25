@@ -1,325 +1,351 @@
 # Enterprise RAG System
 
-A production-grade Retrieval-Augmented Generation (RAG) system that answers questions **strictly from private data** and **never hallucinates**.
+Backend-only Retrieval-Augmented Generation system. Answers questions strictly from ingested documents. Does not hallucinate.
 
-## 🚀 Features
-
-- **Zero Hallucination**: Answers are generated ONLY from ingested documents
-- **Mandatory Source Citation**: Every answer includes document sources with page numbers
-- **Multi-Format Support**: PDF, DOCX, Markdown, and SQL database data
-- **Semantic Chunking**: Intelligent document splitting with overlap handling
-- **Deterministic Embeddings**: Rebuild-safe indexing with caching
-- **Production-Ready**: FAISS vector store with persistence, structured logging, health checks
-
-## 📋 Tech Stack
-
-| Component | Technology |
-|-----------|------------|
-| Framework | FastAPI |
-| RAG Engine | LlamaIndex |
-| Embeddings | OpenAI text-embedding-3-small |
-| LLM | OpenAI GPT-4 Turbo |
-| Vector Store | FAISS (local, persistent) |
-| Validation | Pydantic v2 |
-
-## 📁 Project Structure
+## Architecture
 
 ```
-RAG/
-├── app/
-│   ├── __init__.py
-│   ├── config.py              # Configuration management
-│   ├── main.py                # FastAPI application entry
-│   ├── api/
-│   │   ├── __init__.py
-│   │   ├── dependencies.py    # Dependency injection
-│   │   └── routes/
-│   │       ├── __init__.py
-│   │       ├── health.py      # GET /health
-│   │       ├── ingest.py      # POST /ingest
-│   │       └── query.py       # POST /query
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── embeddings.py      # Embedding service
-│   │   ├── llm.py             # LLM with no-hallucination prompt
-│   │   ├── retriever.py       # RAG pipeline orchestration
-│   │   └── vector_store.py    # FAISS vector store
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── chunker.py         # Semantic chunking
-│   │   ├── loader.py          # Document loaders
-│   │   └── pipeline.py        # Ingestion orchestration
-│   └── schemas/
-│       ├── __init__.py
-│       ├── common.py          # Common response schemas
-│       ├── documents.py       # Document/ingestion schemas
-│       └── query.py           # Query/response schemas
-├── data/
-│   ├── documents/             # Document metadata storage
-│   └── faiss_index/           # FAISS index persistence
-├── .env.example               # Environment template
-├── requirements.txt           # Python dependencies
-└── README.md
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              FastAPI                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │ POST /ingest │  │ POST /query  │  │ GET /health  │                  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────────┘                  │
+└─────────┼─────────────────┼─────────────────────────────────────────────┘
+          │                 │
+          ▼                 ▼
+┌─────────────────┐  ┌─────────────────────────────────────────────────┐
+│ IngestionService│  │              RetrieverService                    │
+│                 │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │
+│ ┌─────────────┐ │  │  │Embedding│─▶│ FAISS   │─▶│  LLM    │          │
+│ │DocumentLoader│ │  │  │ Service │  │ Search  │  │ Service │          │
+│ ├─────────────┤ │  │  └─────────┘  └─────────┘  └─────────┘          │
+│ │  Chunker    │ │  └─────────────────────────────────────────────────┘
+│ └─────────────┘ │
+└─────────────────┘
+          │                 │
+          ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         VectorStoreService                               │
+│                      (FAISS + JSON metadata)                             │
+│                       Persisted to ./data/                               │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 🔧 Installation
+## RAG Flow
 
-### 1. Clone and Setup
+### Ingestion (`POST /ingest`)
+
+```
+Document (PDF/DOCX/MD)
+        │
+        ▼
+┌───────────────┐
+│ DocumentLoader│  Extract text with metadata (page, section)
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│SemanticChunker│  Split into chunks (512 tokens, 50 overlap)
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│EmbeddingService│  Generate embeddings (text-embedding-3-small)
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ VectorStore   │  Store in FAISS + persist to disk
+└───────────────┘
+```
+
+### Query (`POST /query`)
+
+```
+Question
+    │
+    ▼
+┌──────────────────┐
+│ Embed Question   │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ FAISS Similarity │  top_k=5, threshold=0.7
+│     Search       │
+└────────┬─────────┘
+         │
+         ├── NO RESULTS ──▶ Return: "Answer not found in documents."
+         │                  confidence=0.0, sources=[]
+         │
+         ▼ (has results)
+┌──────────────────┐
+│   LLM Generate   │  System prompt: use ONLY context
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ Return answer +  │  Mandatory citations in sources[]
+│    citations     │
+└──────────────────┘
+```
+
+## Hallucination Prevention
+
+The system prevents hallucination through multiple mechanisms:
+
+### 1. Retrieval Gate
+If similarity search returns no results above threshold (default 0.7), generation is skipped entirely. Response:
+```json
+{
+  "answer": "Answer not found in documents.",
+  "sources": [],
+  "confidence": 0.0
+}
+```
+
+### 2. System Prompt Constraint
+The LLM receives this system prompt:
+
+```
+ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
+1. You may ONLY use information explicitly stated in the provided CONTEXT.
+2. You must NEVER use your training data, prior knowledge, or make assumptions.
+3. If the CONTEXT does not contain enough information to answer, you MUST respond:
+   "I don't know based on the provided documents."
+4. If the CONTEXT is empty or completely irrelevant, you MUST respond:
+   "Answer not found in documents."
+```
+
+### 3. Context Isolation
+The LLM only receives retrieved chunks, not the full document corpus. It cannot access information that wasn't retrieved.
+
+### 4. Mandatory Citations
+Every response must include source citations. Empty sources = no answer.
+
+## Setup
+
+### Requirements
+- Python 3.10+
+- OpenAI API key
+
+### Installation
 
 ```bash
 cd RAG
 python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Linux/Mac
+
+# Windows
+venv\Scripts\activate
+# Linux/Mac
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
+### Configuration
+
+Create `.env` file:
 
 ```bash
-copy .env.example .env
-# Edit .env and add your OpenAI API key
+cp .env.example .env
 ```
 
-### 3. Run the Server
+Edit `.env`:
+
+```env
+OPENAI_API_KEY=sk-your-key-here
+```
+
+### Run
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --port 8000
 ```
 
-## 📖 API Reference
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OPENAI_API_KEY` | Yes | - | OpenAI API key |
+| `APP_ENV` | No | development | Environment (development/production) |
+| `LOG_LEVEL` | No | INFO | Logging level |
+| `EMBEDDING_MODEL` | No | text-embedding-3-small | OpenAI embedding model |
+| `EMBEDDING_DIMENSION` | No | 1536 | Embedding vector size |
+| `LLM_MODEL` | No | gpt-4-turbo-preview | OpenAI chat model |
+| `LLM_TEMPERATURE` | No | 0.0 | LLM temperature (0=deterministic) |
+| `SIMILARITY_THRESHOLD` | No | 0.7 | Min similarity for retrieval |
+| `TOP_K` | No | 5 | Max documents to retrieve |
+| `CHUNK_SIZE` | No | 512 | Chunk size in tokens |
+| `CHUNK_OVERLAP` | No | 50 | Overlap between chunks |
+| `FAISS_INDEX_PATH` | No | ./data/faiss_index | FAISS persistence path |
+| `DOCUMENT_STORE_PATH` | No | ./data/documents | Metadata storage path |
+
+## API
 
 ### Health Check
 
-```http
-GET /health
+```bash
+curl http://localhost:8000/health
 ```
 
-**Response:**
+Response:
 ```json
 {
   "status": "healthy",
   "version": "1.0.0",
   "timestamp": "2024-01-15T10:30:00Z",
   "components": {
+    "embeddings": "healthy",
     "vector_store": "healthy",
-    "llm": "healthy",
-    "embeddings": "healthy"
+    "llm": "healthy"
   }
 }
 ```
 
 ### Ingest Document
 
-```http
-POST /ingest
-Content-Type: application/json
+**PDF:**
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document_type": "pdf",
+    "file_path": "C:/path/to/document.pdf",
+    "metadata": {"department": "HR"}
+  }'
 ```
 
-**Request Body (PDF/DOCX):**
-```json
-{
-  "document_type": "pdf",
-  "file_path": "/path/to/document.pdf",
-  "metadata": {
-    "department": "Engineering",
-    "project": "RAG System"
-  }
-}
+**Markdown content:**
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document_type": "markdown",
+    "content": "# Policy\n\nEmployees get 20 vacation days per year.",
+    "metadata": {"source": "hr_policy"}
+  }'
 ```
 
-**Request Body (Markdown):**
-```json
-{
-  "document_type": "markdown",
-  "content": "# Document Title\n\nDocument content here...",
-  "metadata": {
-    "source": "manual_entry"
-  }
-}
-```
-
-**Request Body (SQL):**
-```json
-{
-  "document_type": "sql",
-  "sql_query": "SELECT * FROM knowledge_base WHERE active = 1",
-  "connection_string": "sqlite:///./data/knowledge.db",
-  "metadata": {
-    "table": "knowledge_base"
-  }
-}
-```
-
-**Response:**
+Response:
 ```json
 {
   "success": true,
-  "message": "Successfully ingested document with 45 chunks",
+  "message": "Successfully ingested with 5 chunks",
   "documents": [
     {
-      "document_id": "doc_abc123def456",
-      "source": "technical_manual.pdf",
+      "document_id": "doc_a1b2c3d4e5f6",
+      "source": "document.pdf",
       "document_type": "pdf",
-      "chunk_count": 45,
+      "chunk_count": 5,
       "ingested_at": "2024-01-15T10:30:00Z",
-      "metadata": {}
+      "metadata": {"department": "HR"}
     }
   ],
-  "total_chunks": 45,
-  "processing_time_ms": 1523.45
+  "total_chunks": 5,
+  "processing_time_ms": 1234.56
 }
 ```
 
-### File Upload
+### Query
 
-```http
-POST /ingest/file
-Content-Type: multipart/form-data
+```bash
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "How many vacation days do employees get?"
+  }'
 ```
 
-Upload files directly via multipart form.
-
-### Query Documents
-
-```http
-POST /query
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "question": "What is the company's remote work policy?",
-  "top_k": 5,
-  "similarity_threshold": 0.7,
-  "include_context": false,
-  "metadata_filter": {
-    "department": "HR"
-  }
-}
-```
-
-**Response (Answer Found):**
+**Response (answer found):**
 ```json
 {
   "success": true,
-  "answer": "According to the HR policy document, employees can work remotely up to 3 days per week with manager approval. [Source 1]",
+  "answer": "Employees get 20 vacation days per year. [Source 1]",
   "sources": [
     {
-      "document_id": "doc_abc123",
-      "source": "hr_policies.pdf",
-      "page_number": 15,
-      "section": "Remote Work Policy",
-      "relevance_score": 0.92,
-      "chunk_text": "Employees may request remote work..."
+      "document_id": "doc_a1b2c3d4e5f6",
+      "source": "hr_policy",
+      "page_number": null,
+      "section": "Policy",
+      "relevance_score": 0.89,
+      "chunk_text": "Employees get 20 vacation days per year."
     }
   ],
-  "confidence": 0.89,
-  "query_time_ms": 1245.67,
-  "retrieval_time_ms": 89.23,
-  "generation_time_ms": 1156.44
+  "confidence": 0.85,
+  "query_time_ms": 1456.78,
+  "retrieval_time_ms": 45.23,
+  "generation_time_ms": 1411.55
 }
 ```
 
-**Response (No Context Found):**
+**Response (no answer):**
 ```json
 {
   "success": true,
   "answer": "Answer not found in documents.",
   "sources": [],
   "confidence": 0.0,
-  "query_time_ms": 234.56
+  "query_time_ms": 45.23,
+  "retrieval_time_ms": 45.23,
+  "generation_time_ms": 0.0
 }
 ```
 
-## 🔒 No-Hallucination Guarantee
-
-The system enforces strict context-only answers through:
-
-1. **System Prompt**: Explicit instructions to NEVER use prior knowledge
-2. **Empty Context Handling**: Returns "Answer not found" when no relevant docs
-3. **Similarity Threshold**: Filters out low-relevance matches (default: 0.7)
-4. **Confidence Scoring**: Tracks answer reliability (0.0 = no answer)
-5. **Mandatory Citations**: Every answer must reference source documents
-
-## ⚙️ Configuration
-
-All settings are configurable via environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` | required | OpenAI API key |
-| `EMBEDDING_MODEL` | text-embedding-3-small | Embedding model |
-| `LLM_MODEL` | gpt-4-turbo-preview | LLM for generation |
-| `LLM_TEMPERATURE` | 0.0 | Zero for deterministic output |
-| `SIMILARITY_THRESHOLD` | 0.7 | Minimum relevance score |
-| `TOP_K` | 5 | Max documents to retrieve |
-| `CHUNK_SIZE` | 512 | Tokens per chunk |
-| `CHUNK_OVERLAP` | 50 | Overlap between chunks |
-
-## 🧪 Example Usage
-
-### Python Client
-
-```python
-import httpx
-
-BASE_URL = "http://localhost:8000"
-
-# Ingest a PDF
-response = httpx.post(f"{BASE_URL}/ingest", json={
-    "document_type": "pdf",
-    "file_path": "./documents/handbook.pdf",
-    "metadata": {"category": "policies"}
-})
-print(response.json())
-
-# Query
-response = httpx.post(f"{BASE_URL}/query", json={
-    "question": "What are the vacation policies?",
-    "include_context": True
-})
-result = response.json()
-print(f"Answer: {result['answer']}")
-print(f"Sources: {[s['source'] for s in result['sources']]}")
-```
-
-### cURL
+### Query with Options
 
 ```bash
-# Health check
-curl http://localhost:8000/health
-
-# Ingest markdown
-curl -X POST http://localhost:8000/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "document_type": "markdown",
-    "content": "# Company Policy\n\nAll employees must...",
-    "metadata": {"category": "policies"}
-  }'
-
-# Query
 curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What must all employees do?"}'
+  -d '{
+    "question": "What is the remote work policy?",
+    "top_k": 3,
+    "similarity_threshold": 0.8,
+    "include_context": true,
+    "metadata_filter": {"department": "HR"}
+  }'
 ```
 
-## 📊 Performance
+## Project Structure
 
-- **Embedding Generation**: ~100 chunks/second
-- **FAISS Search**: <50ms for 100K vectors
-- **End-to-End Query**: ~1-2 seconds (depends on LLM)
+```
+RAG/
+├── app/
+│   ├── __init__.py
+│   ├── config.py              # Pydantic Settings
+│   ├── main.py                # FastAPI app
+│   ├── api/
+│   │   ├── dependencies.py    # DI singletons
+│   │   └── routes/
+│   │       ├── health.py      # GET /health
+│   │       ├── ingest.py      # POST /ingest
+│   │       └── query.py       # POST /query
+│   ├── core/
+│   │   ├── embeddings.py      # OpenAI embeddings + cache
+│   │   ├── llm.py             # OpenAI chat + no-hallucination prompt
+│   │   ├── retriever.py       # RAG orchestration
+│   │   └── vector_store.py    # FAISS + persistence
+│   ├── ingestion/
+│   │   ├── loader.py          # PDF/DOCX/MD loaders
+│   │   ├── chunker.py         # Semantic chunking
+│   │   └── pipeline.py        # Ingestion orchestration
+│   └── schemas/
+│       ├── common.py          # HealthResponse, ErrorResponse
+│       ├── documents.py       # IngestRequest/Response
+│       └── query.py           # QueryRequest/Response, SourceCitation
+├── data/
+│   ├── documents/             # Metadata JSON
+│   └── faiss_index/           # FAISS index files
+├── .env.example
+├── requirements.txt
+└── README.md
+```
 
-## 🛡️ Production Considerations
+## Data Persistence
 
-1. **API Key Security**: Use secrets management in production
-2. **Rate Limiting**: Add middleware for API rate limits
-3. **Monitoring**: Integrate with observability tools (metrics, traces)
-4. **Scaling**: Consider IVF FAISS index for >1M vectors
-5. **Backup**: Regularly backup `data/` directory
+- FAISS index: `./data/faiss_index/faiss.index`
+- Chunk metadata: `./data/faiss_index/chunks.json`
+- Document metadata: `./data/faiss_index/documents.json`
+- Embedding cache: `./data/documents/embedding_cache/`
 
-## 📄 License
-
-MIT License - See LICENSE file for details.
+All data survives restarts. Delete `./data/` to reset.
