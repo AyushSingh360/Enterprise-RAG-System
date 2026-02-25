@@ -159,11 +159,6 @@ class EmbeddingService:
     )
     async def _generate_embedding(self, text: str) -> list[float]:
         """Generate embedding for a single text using OpenAI API."""
-        if self._settings.openai_api_key_value == "your-openai-api-key-here":
-            import random
-            random.seed(text)
-            return [random.uniform(-1, 1) for _ in range(self._settings.embedding_dimension)]
-
         response = await self.client.embeddings.create(
             model=self._settings.embedding_model,
             input=text,
@@ -178,14 +173,6 @@ class EmbeddingService:
     )
     async def _generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts in a single API call."""
-        if self._settings.openai_api_key_value == "your-openai-api-key-here":
-            import random
-            results = []
-            for text in texts:
-                random.seed(text)
-                results.append([random.uniform(-1, 1) for _ in range(self._settings.embedding_dimension)])
-            return results
-
         response = await self.client.embeddings.create(
             model=self._settings.embedding_model,
             input=texts,
