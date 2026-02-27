@@ -152,35 +152,26 @@ class EmbeddingService:
             )
         return self._client
     
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=5, max=60),
-        retry=retry_if_exception_type((RateLimitError, APIError)),
-    )
     async def _generate_embedding(self, text: str) -> list[float]:
-        """Generate embedding for a single text using OpenAI API."""
-        response = await self.client.embeddings.create(
-            model=self._settings.embedding_model,
-            input=text,
-            dimensions=self._settings.embedding_dimension,
-        )
-        return response.data[0].embedding
+        """Generate a deterministic mock embedding using random seeded by text."""
+        import random
+        from typing import cast
+        
+        # Seed random with text to make it deterministic (same text = same vector)
+        h = self._cache._get_hash(text)
+        random.seed(h)
+        
+        dim = self._settings.embedding_dimension
+        vector = [random.uniform(-1.0, 1.0) for _ in range(dim)]
+        
+        # Normalize
+        norm = sum(x * x for x in vector) ** 0.5
+        vector = [x / norm for x in vector]
+        return cast(list[float], vector)
     
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=5, max=60),
-        retry=retry_if_exception_type((RateLimitError, APIError)),
-    )
     async def _generate_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for multiple texts in a single API call."""
-        response = await self.client.embeddings.create(
-            model=self._settings.embedding_model,
-            input=texts,
-            dimensions=self._settings.embedding_dimension,
-        )
-        # Sort by index to maintain order
-        sorted_data = sorted(response.data, key=lambda x: x.index)
-        return [item.embedding for item in sorted_data]
+        """Generate mock embeddings for multiple texts."""
+        return [await self._generate_embedding(text) for text in texts]
     
     async def get_embedding(self, text: str, use_cache: bool = True) -> list[float]:
         """

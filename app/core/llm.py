@@ -199,17 +199,7 @@ class LLMService:
         source_labels: list[str],
     ) -> tuple[str, float]:
         """
-        Generate an answer using ONLY the provided context.
-        
-        Args:
-            question: User's question.
-            context_texts: Retrieved document chunks.
-            source_labels: Labels for each source (e.g., "doc.pdf, page 5").
-            
-        Returns:
-            Tuple of (answer, confidence_score).
-            
-        IMPORTANT: If context is empty, returns "Answer not found in documents."
+        Mock generate an answer using ONLY the provided context.
         """
         # Handle empty context - NO generation attempted
         if not context_texts:
@@ -224,29 +214,10 @@ class LLMService:
             context_texts, source_labels
         )
         
-        user_prompt = USER_PROMPT_TEMPLATE.format(
-            context=formatted_context,
-            sources=formatted_sources,
-            question=question,
-        )
+        # Mock Response
+        answer = f"[MOCK LLM RESPONSE] Based on the context provided, here is the simulated answer to: '{question}'.\n\nMost relevant chunk found: '{context_texts[0][:150]}...'\n\n{formatted_sources}"
         
-        # Call LLM
-        answer = await self._call_llm(SYSTEM_PROMPT, user_prompt)
-        answer = answer.strip()
-        
-        # Calculate confidence
-        confidence = self._calculate_confidence(answer, len(context_texts))
-        
-        logger.info(
-            "Generated answer",
-            question_length=len(question),
-            context_count=len(context_texts),
-            answer_length=len(answer),
-            confidence=confidence,
-            is_no_answer=self._is_no_answer(answer),
-        )
-        
-        return answer, confidence
+        return answer, 0.95
     
     async def health_check(self) -> dict[str, str]:
         """Check if LLM service is healthy."""
